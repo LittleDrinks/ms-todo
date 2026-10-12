@@ -1,0 +1,375 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "msal>=1.31.0",
+#     "requests>=2.31.0",
+# ]
+# ///
+
+"""
+Microsoft To Do CLI
+Zero-config Microsoft Graph API client for Microsoft To Do.
+Uses MSAL Device Code Flow with Microsoft's public multi-tenant Client ID.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import msal
+import requests
+
+CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+AUTHORITY = "https://login.microsoftonline.com/common"
+SCOPES = ["Tasks.ReadWrite", "User.Read"]
+CONFIG_DIR = Path.home() / ".config" / "ms-todo"
+CACHE_PATH = CONFIG_DIR / "token_cache.bin"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _load_cache() -> msal.SerializableTokenCache:
+    cache = msal.SerializableTokenCache()
+    if CACHE_PATH.exists():
+        try:
+            cache.deserialize(CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return cache
+
+
+def _save_cache(cache: msal.SerializableTokenCache) -> None:
+    if cache.has_state_changed:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_PATH.write_text(cache.serialize(), encoding="utf-8")
+        try:
+            os.chmod(CACHE_PATH, 0o600)
+        except Exception:
+            pass
+
+
+def get_token(force_interactive: bool = False) -> str:
+    cache = _load_cache()
+    app = msal.PublicClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        token_cache=cache,
+    )
+
+    if not force_interactive:
+        accounts = app.get_accounts()
+        if accounts:
+            result = app.acquire_token_silent(SCOPES, account=accounts[0])
+            if result and "access_token" in result:
+                _save_cache(cache)
+                return result["access_token"]
+
+    # Device code flow
+    flow = app.initiate_device_flow(scopes=SCOPES)
+    if "user_code" not in flow:
+        raise RuntimeError(f"无法发起设备授权流程: {flow.get('error_description', flow)}")
+
+    sys.stderr.write("\n======================================================\n")
+    sys.stderr.write("🔑 Microsoft To Do 认证授权\n")
+    sys.stderr.write(f"👉 1. 请在浏览器打开: {flow['verification_uri']}\n")
+    sys.stderr.write(f"👉 2. 输入授权码: {flow['user_code']}\n")
+    sys.stderr.write("======================================================\n\n")
+    sys.stderr.flush()
+
+    result = app.acquire_token_by_device_flow(flow)
+    if "access_token" not in result:
+        err = result.get("error_description", result.get("error", "未知认证错误"))
+        raise RuntimeError(f"认证失败: {err}")
+
+    _save_cache(cache)
+    sys.stderr.write("✓ 认证成功，凭据已保存到本地。\n")
+    sys.stderr.flush()
+    return result["access_token"]
+
+
+def _headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def api_get(endpoint: str, token: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = f"{GRAPH_BASE}/{endpoint.lstrip('/')}"
+    resp = requests.get(url, headers=_headers(token), params=params, timeout=20)
+    if not resp.ok:
+        raise RuntimeError(f"Graph API 请求失败 [{resp.status_code}]: {resp.text}")
+    return resp.json()
+
+
+def api_post(endpoint: str, token: str, data: Dict[str, Any]) -> Any:
+    url = f"{GRAPH_BASE}/{endpoint.lstrip('/')}"
+    resp = requests.post(url, headers=_headers(token), json=data, timeout=20)
+    if not resp.ok:
+        raise RuntimeError(f"Graph API 写入失败 [{resp.status_code}]: {resp.text}")
+    return resp.json()
+
+
+def api_patch(endpoint: str, token: str, data: Dict[str, Any]) -> Any:
+    url = f"{GRAPH_BASE}/{endpoint.lstrip('/')}"
+    resp = requests.patch(url, headers=_headers(token), json=data, timeout=20)
+    if not resp.ok:
+        raise RuntimeError(f"Graph API 更新失败 [{resp.status_code}]: {resp.text}")
+    return resp.json()
+
+
+def api_delete(endpoint: str, token: str) -> None:
+    url = f"{GRAPH_BASE}/{endpoint.lstrip('/')}"
+    resp = requests.delete(url, headers=_headers(token), timeout=20)
+    if not resp.ok and resp.status_code != 204:
+        raise RuntimeError(f"Graph API 删除失败 [{resp.status_code}]: {resp.text}")
+
+
+# --- Commands ---
+
+
+def cmd_auth(args: argparse.Namespace) -> None:
+    token = get_token(force_interactive=True)
+    me = api_get("me", token)
+    user_name = me.get("displayName", "用户")
+    user_email = me.get("mail") or me.get("userPrincipalName", "未知")
+    print(json.dumps({"status": "authenticated", "user": user_name, "email": user_email}, ensure_ascii=False, indent=2))
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    cache = _load_cache()
+    app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    accounts = app.get_accounts()
+    if not accounts:
+        print(json.dumps({"status": "not_authenticated"}, ensure_ascii=False, indent=2))
+        return
+
+    try:
+        token = get_token(force_interactive=False)
+        me = api_get("me", token)
+        print(json.dumps({
+            "status": "authenticated",
+            "name": me.get("displayName"),
+            "email": me.get("mail") or me.get("userPrincipalName"),
+        }, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False, indent=2))
+
+
+def cmd_lists(args: argparse.Namespace) -> None:
+    token = get_token()
+    data = api_get("me/todo/lists", token)
+    lists = [{"id": item["id"], "name": item["displayName"], "isOwner": item.get("isOwner", True)} for item in data.get("value", [])]
+    if args.json:
+        print(json.dumps({"lists": lists}, ensure_ascii=False, indent=2))
+    else:
+        for idx, lst in enumerate(lists):
+            print(f"[{idx}] {lst['name']} (id: {lst['id']})")
+
+
+def _resolve_list_id(token: str, list_identifier: Optional[str]) -> str:
+    data = api_get("me/todo/lists", token)
+    all_lists = data.get("value", [])
+    if not all_lists:
+        raise RuntimeError("微软 To Do 账户中未找到任何任务清单。")
+
+    if not list_identifier:
+        # Default: find list named "Tasks" or "任务", else first list
+        for l in all_lists:
+            if l.get("displayName") in ("Tasks", "任务"):
+                return l["id"]
+        return all_lists[0]["id"]
+
+    # Match by ID exactly
+    for l in all_lists:
+        if l["id"] == list_identifier:
+            return l["id"]
+
+    # Match by index
+    if list_identifier.isdigit():
+        idx = int(list_identifier)
+        if 0 <= idx < len(all_lists):
+            return all_lists[idx]["id"]
+
+    # Match by name (case-insensitive)
+    for l in all_lists:
+        if l.get("displayName", "").lower() == list_identifier.lower():
+            return l["id"]
+
+    raise RuntimeError(f"未找到名为或匹配 ID 的任务清单: '{list_identifier}'")
+
+
+def cmd_tasks(args: argparse.Namespace) -> None:
+    token = get_token()
+    list_id = _resolve_list_id(token, args.list)
+
+    params: Dict[str, Any] = {}
+    if not args.all:
+        params["$filter"] = "status ne 'completed'"
+
+    data = api_get(f"me/todo/lists/{list_id}/tasks", token, params=params)
+    raw_tasks = data.get("value", [])
+
+    tasks = []
+    for item in raw_tasks:
+        due = item.get("dueDateTime", {}).get("dateTime", "") if item.get("dueDateTime") else None
+        if due and "T" in due:
+            due = due.split("T")[0]
+        body = item.get("body", {}).get("content", "") if item.get("body") else ""
+        tasks.append({
+            "id": item["id"],
+            "title": item["title"],
+            "status": item["status"],
+            "importance": item["importance"],
+            "due_date": due,
+            "created_at": item.get("createdDateTime", ""),
+            "note": body.strip(),
+        })
+
+    if args.json:
+        print(json.dumps({"list_id": list_id, "tasks": tasks}, ensure_ascii=False, indent=2))
+    else:
+        if not tasks:
+            print("清单中没有待办任务。")
+            return
+        for idx, t in enumerate(tasks):
+            star = " ★" if t["importance"] == "high" else ""
+            due_str = f" [截止: {t['due_date']}]" if t["due_date"] else ""
+            status_mark = "[x]" if t["status"] == "completed" else "[ ]"
+            print(f"[{idx}] {status_mark} {t['title']}{star}{due_str} (id: {t['id']})")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    token = get_token()
+    list_id = _resolve_list_id(token, args.list)
+
+    payload: Dict[str, Any] = {"title": args.title}
+    if args.due:
+        payload["dueDateTime"] = {
+            "dateTime": f"{args.due}T00:00:00",
+            "timeZone": "Asia/Shanghai",
+        }
+    if args.important:
+        payload["importance"] = "high"
+    if args.note:
+        payload["body"] = {"content": args.note, "contentType": "text"}
+
+    res = api_post(f"me/todo/lists/{list_id}/tasks", token, payload)
+    task_id = res["id"]
+
+    if args.json:
+        print(json.dumps({"status": "created", "id": task_id, "title": args.title, "list_id": list_id}, ensure_ascii=False, indent=2))
+    else:
+        print(f"✓ 成功创建任务: '{args.title}' (id: {task_id})")
+
+
+def cmd_complete(args: argparse.Namespace) -> None:
+    token = get_token()
+    list_id = _resolve_list_id(token, args.list)
+
+    task_id = args.task_id
+    # If integer, resolve from current list tasks
+    if task_id.isdigit():
+        idx = int(task_id)
+        data = api_get(f"me/todo/lists/{list_id}/tasks?$filter=status ne 'completed'", token)
+        tasks = data.get("value", [])
+        if 0 <= idx < len(tasks):
+            task_id = tasks[idx]["id"]
+        else:
+            raise RuntimeError(f"索引超出范围: {idx} (有效范围 0-{len(tasks)-1})")
+
+    res = api_patch(f"me/todo/lists/{list_id}/tasks/{task_id}", token, {"status": "completed"})
+    if args.json:
+        print(json.dumps({"status": "completed", "id": task_id, "title": res.get("title")}, ensure_ascii=False, indent=2))
+    else:
+        print(f"✓ 已标记完成: '{res.get('title')}'")
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    token = get_token()
+    list_id = _resolve_list_id(token, args.list)
+
+    task_id = args.task_id
+    if task_id.isdigit():
+        idx = int(task_id)
+        data = api_get(f"me/todo/lists/{list_id}/tasks", token)
+        tasks = data.get("value", [])
+        if 0 <= idx < len(tasks):
+            task_id = tasks[idx]["id"]
+        else:
+            raise RuntimeError(f"索引超出范围: {idx}")
+
+    api_delete(f"me/todo/lists/{list_id}/tasks/{task_id}", token)
+    if args.json:
+        print(json.dumps({"status": "deleted", "id": task_id}, ensure_ascii=False, indent=2))
+    else:
+        print(f"✓ 已删除任务: {task_id}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Microsoft To Do CLI (Device Code Flow)")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # auth
+    subparsers.add_parser("auth", help="发起设备代码认证流程并保存凭据")
+
+    # status
+    subparsers.add_parser("status", help="检查当前登录状态")
+
+    # lists
+    p_lists = subparsers.add_parser("lists", help="列出所有任务清单")
+    p_lists.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # tasks
+    p_tasks = subparsers.add_parser("tasks", help="查看任务清单中的待办事项")
+    p_tasks.add_argument("-l", "--list", default=None, help="清单名称、索引或 ID (默认: Tasks/任务清单)")
+    p_tasks.add_argument("-a", "--all", action="store_true", help="包含已完成的任务")
+    p_tasks.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # add
+    p_add = subparsers.add_parser("add", help="新增待办任务")
+    p_add.add_argument("title", help="任务标题")
+    p_add.add_argument("-l", "--list", default=None, help="目标清单名称或 ID")
+    p_add.add_argument("-d", "--due", default=None, help="截止日期 (YYYY-MM-DD)")
+    p_add.add_argument("-i", "--important", action="store_true", help="标记为重要")
+    p_add.add_argument("-n", "--note", default=None, help="备注内容")
+    p_add.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # complete
+    p_comp = subparsers.add_parser("complete", help="标记任务为完成")
+    p_comp.add_argument("task_id", help="任务 ID 或列表索引数字")
+    p_comp.add_argument("-l", "--list", default=None, help="任务所属清单")
+    p_comp.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    # delete
+    p_del = subparsers.add_parser("delete", help="删除任务")
+    p_del.add_argument("task_id", help="任务 ID 或列表索引数字")
+    p_del.add_argument("-l", "--list", default=None, help="任务所属清单")
+    p_del.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    try:
+        cmds = {
+            "auth": cmd_auth,
+            "status": cmd_status,
+            "lists": cmd_lists,
+            "tasks": cmd_tasks,
+            "add": cmd_add,
+            "complete": cmd_complete,
+            "delete": cmd_delete,
+        }
+        cmds[args.command](args)
+    except Exception as e:
+        sys.stderr.write(f"错误: {e}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
